@@ -1,0 +1,3 @@
+[submodule "devine/services"]
+	path = devine/services
+	url = git@github.com-devatadev:DevataDev/Devine-Services.git
