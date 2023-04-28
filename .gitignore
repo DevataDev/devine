@@ -123,3 +123,4 @@ venv.bak/
 .mypy_cache/
 .directory
 .idea/dataSources.local.xml
+.vscode/settings.json
