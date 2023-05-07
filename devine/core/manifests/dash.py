@@ -69,7 +69,7 @@ class DASH:
                 "Failed to request the MPD document.",
                 response=res
             )
-
+        
         return DASH.from_text(res.text, url)
 
     @classmethod
@@ -215,6 +215,7 @@ class DASH:
                         is_original_lang=not track_lang or not language or is_close_match(track_lang, [language]),
                         descriptor=Video.Descriptor.MPD,
                         extra=(rep, adaptation_set),
+                        manifest=self.manifest,
                         # video track args
                         **(dict(
                             range_=(
@@ -309,8 +310,8 @@ class DASH:
             representation.findall("ContentProtection") +
             adaptation_set.findall("ContentProtection")
         )
-
-        manifest = load_xml(session.get(manifest_url).text)
+        print(track.__dict__)
+        manifest = load_xml(session.get(manifest_url).text) if track.manifest is None else track.manifest
         manifest_url_query = urlparse(manifest_url).query
 
         manifest_base_url = manifest.findtext("BaseURL")

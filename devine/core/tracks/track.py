@@ -36,7 +36,8 @@ class Track:
         needs_repack: bool = False,
         drm: Optional[Iterable[DRM_T]] = None,
         edition: Optional[str] = None,
-        extra: Optional[Any] = None
+        extra: Optional[Any] = None,
+        manifest: Optional[Any] = None
     ) -> None:
         self.id = id_
         self.url = url
@@ -52,6 +53,7 @@ class Track:
         # extra data
         self.edition: str = edition
         self.extra: Any = extra or {}  # allow anything for extra, but default to a dict
+        self.manifest: Any = manifest
 
         # events
         self.OnSegmentFilter: Optional[Callable] = None
