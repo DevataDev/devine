@@ -310,7 +310,6 @@ class DASH:
             representation.findall("ContentProtection") +
             adaptation_set.findall("ContentProtection")
         )
-        print(track.__dict__)
         manifest = load_xml(session.get(manifest_url).text) if track.manifest is None else track.manifest
         manifest_url_query = urlparse(manifest_url).query
 
