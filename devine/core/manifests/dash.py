@@ -209,7 +209,7 @@ class DASH:
 
                     tracks.add(track_type(
                         id_=track_id,
-                        url=(self.url, rep, adaptation_set, period),
+                        url=(self.url, self.manifest, rep, adaptation_set, period),
                         codec=track_codec,
                         language=track_lang,
                         is_original_lang=not track_lang or not language or is_close_match(track_lang, [language]),
@@ -284,6 +284,7 @@ class DASH:
         save_path: Path,
         save_dir: Path,
         stop_event: Event,
+        skip_event: Event,
         progress: partial,
         session: Optional[Session] = None,
         proxy: Optional[str] = None,
@@ -304,13 +305,12 @@ class DASH:
 
         log = logging.getLogger("DASH")
 
-        manifest_url, representation, adaptation_set, period = track.url
+        manifest_url, manifest, representation, adaptation_set, period = track.url
 
         track.drm = DASH.get_drm(
             representation.findall("ContentProtection") +
             adaptation_set.findall("ContentProtection")
         )
-        manifest = load_xml(session.get(manifest_url).text) if track.manifest is None else track.manifest
         manifest_url_query = urlparse(manifest_url).query
 
         manifest_base_url = manifest.findtext("BaseURL")
@@ -458,6 +458,10 @@ class DASH:
                     license_widevine(drm, track_kid=track_kid)
             else:
                 drm = None
+
+            if skip_event.is_set():
+                progress(downloaded="[yellow]SKIPPED")
+                return
 
             def download_segment(filename: str, segment: tuple[str, Optional[str]]) -> int:
                 if stop_event.is_set():
