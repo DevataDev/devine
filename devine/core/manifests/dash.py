@@ -211,66 +211,7 @@ class DASH:
                         is_original_lang=language and is_close_match(track_lang, [language]),
                         descriptor=Video.Descriptor.MPD,
                         extra=(rep, adaptation_set),
-<<<<<<< HEAD
-                        manifest=self.manifest,
-                        # video track args
-                        **(dict(
-                            range_=(
-                                Video.Range.DV
-                                if codecs.startswith(("dva1", "dvav", "dvhe", "dvh1")) else
-                                Video.Range.from_cicp(
-                                    primaries=next((
-                                        int(x.get("value"))
-                                        for x in (
-                                            adaptation_set.findall("SupplementalProperty")
-                                            + adaptation_set.findall("EssentialProperty")
-                                        )
-                                        if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ColourPrimaries"
-                                    ), 0),
-                                    transfer=next((
-                                        int(x.get("value"))
-                                        for x in (
-                                            adaptation_set.findall("SupplementalProperty")
-                                            + adaptation_set.findall("EssentialProperty")
-                                        )
-                                        if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:TransferCharacteristics"
-                                    ), 0),
-                                    matrix=next((
-                                        int(x.get("value"))
-                                        for x in (
-                                            adaptation_set.findall("SupplementalProperty")
-                                            + adaptation_set.findall("EssentialProperty")
-                                        )
-                                        if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:MatrixCoefficients"
-                                    ), 0)
-                                )
-                            ),
-                            bitrate=rep.get("bandwidth"),
-                            width=int(rep.get("width") or 0) or adaptation_set.get("width"),
-                            height=int(rep.get("height") or 0) or adaptation_set.get("height"),
-                            fps=(
-                                rep.get("frameRate") or
-                                adaptation_set.get("frameRate") or
-                                (
-                                    rep.find("SegmentBase").get("timescale") if
-                                    rep.find("SegmentBase") is not None else None
-                                )
-                            )
-                        ) if track_type is Video else dict(
-                            bitrate=rep.get("bandwidth"),
-                            channels=next(iter(
-                                rep.xpath("AudioChannelConfiguration/@value")
-                                or adaptation_set.xpath("AudioChannelConfiguration/@value")
-                            ), None),
-                            joc=joc,
-                            descriptive=descriptive
-                        ) if track_type is Audio else dict(
-                            forced=forced,
-                            cc=cc
-                        ) if track_type is Subtitle else {})
-=======
                         **track_args
->>>>>>> d369e6134c65359e4842ba5e8b1a854d0bdb4cd0
                     ))
 
             # only get tracks from the first main-content period
