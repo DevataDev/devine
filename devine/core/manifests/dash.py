@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import logging
 import math
@@ -14,19 +13,21 @@ from functools import partial
 from hashlib import md5
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, MutableMapping
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
 
 import requests
 from langcodes import Language, tag_is_valid
+from lxml.etree import Element
 from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.pssh import PSSH
 from requests import Session
+from requests.cookies import RequestsCookieJar
 from rich import filesize
 
 from devine.core.constants import AnyTrack
-from devine.core.downloaders import aria2c
+from devine.core.downloaders import downloader, requests as requests_downloader
 from devine.core.drm import Widevine
 from devine.core.tracks import Audio, Subtitle, Tracks, Video
 from devine.core.utilities import is_close_match
@@ -88,12 +89,17 @@ class DASH:
 
         return cls(manifest, url)
 
-    def to_tracks(self, language: Union[str, Language], period_filter: Optional[Callable] = None) -> Tracks:
+    def to_tracks(
+        self,
+        language: Optional[Union[str, Language]] = None,
+        period_filter: Optional[Callable] = None
+    ) -> Tracks:
         """
-        Convert an MPEG-DASH MPD (Media Presentation Description) document to Video, Audio and Subtitle Track objects.
+        Convert an MPEG-DASH document to Video, Audio and Subtitle Track objects.
 
         Parameters:
-            language: Language you expect the Primary Track to be in.
+            language: The Title's Original Recorded Language. It will also be used as a fallback
+                track language value if the manifest does not list language information.
             period_filter: Filter out period's within the manifest.
 
         All Track URLs will be a list of segment URLs.
@@ -105,116 +111,107 @@ class DASH:
                 continue
 
             for adaptation_set in period.findall("AdaptationSet"):
-                trick_mode = any(
-                    x.get("schemeIdUri") == "http://dashif.org/guidelines/trickmode"
-                    for x in (
-                            adaptation_set.findall("EssentialProperty") +
-                            adaptation_set.findall("SupplementalProperty")
-                    )
-                )
-                if trick_mode:
+                if self.is_trick_mode(adaptation_set):
                     # we don't want trick mode streams (they are only used for fast-forward/rewind)
                     continue
 
-                descriptive = any(
-                    (x.get("schemeIdUri"), x.get("value")) == ("urn:mpeg:dash:role:2011", "descriptive")
-                    for x in adaptation_set.findall("Accessibility")
-                ) or any(
-                    (x.get("schemeIdUri"), x.get("value")) == ("urn:tva:metadata:cs:AudioPurposeCS:2007", "1")
-                    for x in adaptation_set.findall("Accessibility")
-                )
-                forced = any(
-                    x.get("schemeIdUri") == "urn:mpeg:dash:role:2011"
-                    and x.get("value") in ("forced-subtitle", "forced_subtitle")
-                    for x in adaptation_set.findall("Role")
-                )
-                cc = any(
-                    (x.get("schemeIdUri"), x.get("value")) == ("urn:mpeg:dash:role:2011", "caption")
-                    for x in adaptation_set.findall("Role")
-                )
-
                 for rep in adaptation_set.findall("Representation"):
-                    codecs = rep.get("codecs") or adaptation_set.get("codecs")
+                    get = partial(self._get, adaptation_set=adaptation_set, representation=rep)
+                    findall = partial(self._findall, adaptation_set=adaptation_set, representation=rep, both=True)
 
-                    content_type = adaptation_set.get("contentType") or \
-                        adaptation_set.get("mimeType") or \
-                        rep.get("contentType") or \
-                        rep.get("mimeType")
-                    if not content_type:
-                        raise ValueError("No content type value could be found")
-                    content_type = content_type.split("/")[0]
+                    codecs = get("codecs")
+                    content_type = get("contentType")
+                    mime_type = get("mimeType")
 
-                    if content_type.startswith("image"):
-                        # we don't want what's likely thumbnails for the seekbar
-                        continue
-                    if content_type == "application":
-                        # possibly application/mp4 which could be mp4-boxed subtitles
+                    if not content_type and mime_type:
+                        content_type = mime_type.split("/")[0]
+                    if not content_type and not mime_type:
+                        raise ValueError("Unable to determine the format of a Representation, cannot continue...")
+
+                    if mime_type == "application/mp4" or content_type == "application":
+                        # likely mp4-boxed subtitles
+                        # TODO: It may not actually be subtitles
                         try:
-                            Subtitle.Codec.from_mime(codecs)
+                            real_codec = Subtitle.Codec.from_mime(codecs)
                             content_type = "text"
+                            mime_type = f"application/mp4; codecs='{real_codec.value.lower()}'"
                         except ValueError:
                             raise ValueError(f"Unsupported content type '{content_type}' with codecs of '{codecs}'")
 
-                    if content_type == "text":
-                        mime = adaptation_set.get("mimeType")
-                        if mime and not mime.endswith("/mp4"):
-                            codecs = mime.split("/")[1]
+                    if content_type == "text" and mime_type and "/mp4" not in mime_type:
+                        # mimeType likely specifies the subtitle codec better than `codecs`
+                        codecs = mime_type.split("/")[1]
 
-                    supplements = rep.findall("SupplementalProperty") + adaptation_set.findall("SupplementalProperty")
-
-                    joc = next((
-                        x.get("value")
-                        for x in supplements
-                        if x.get("schemeIdUri") == "tag:dolby.com,2018:dash:EC3_ExtensionComplexityIndex:2018"
-                    ), None)
-
-                    if rep.get("id") is not None:
-                        rep_id_lang = re.match(r"\w+_(\w+)=\d+", rep.get("id"))
-                        if rep_id_lang:
-                            rep_id_lang = rep_id_lang.group(1)
-                    else:
-                        rep_id_lang = None
-
-                    track_lang = DASH.get_language(rep.get("lang"), adaptation_set.get("lang"), rep_id_lang, language)
-                    if not track_lang:
-                        raise ValueError(
-                            "One or more Tracks had no Language information. "
-                            "The provided fallback language is not valid or is `None` or `und`."
+                    if content_type == "video":
+                        track_type = Video
+                        track_codec = Video.Codec.from_codecs(codecs)
+                        track_args = dict(
+                            range_=self.get_video_range(
+                                codecs,
+                                findall("SupplementalProperty"),
+                                findall("EssentialProperty")
+                            ),
+                            bitrate=get("bandwidth") or None,
+                            width=get("width") or 0,
+                            height=get("height") or 0,
+                            fps=get("frameRate") or rep.find("SegmentBase", {}).get("timescale") or None
                         )
+                    elif content_type == "audio":
+                        track_type = Audio
+                        track_codec = Audio.Codec.from_codecs(codecs)
+                        track_args = dict(
+                            bitrate=get("bandwidth") or None,
+                            channels=next(iter(
+                                rep.xpath("AudioChannelConfiguration/@value")
+                                or adaptation_set.xpath("AudioChannelConfiguration/@value")
+                            ), None),
+                            joc=self.get_ddp_complexity_index(adaptation_set, rep),
+                            descriptive=self.is_descriptive(adaptation_set)
+                        )
+                    elif content_type == "text":
+                        track_type = Subtitle
+                        track_codec = Subtitle.Codec.from_codecs(codecs or "vtt")
+                        track_args = dict(
+                            forced=self.is_forced(adaptation_set),
+                            cc=self.is_closed_caption(adaptation_set)
+                        )
+                    elif content_type == "image":
+                        # we don't want what's likely thumbnails for the seekbar
+                        continue
+                    else:
+                        raise ValueError(f"Unknown Track Type '{content_type}'")
+
+                    track_lang = self.get_language(adaptation_set, rep, fallback=language)
+                    if not track_lang:
+                        msg = "Language information could not be derived from a Representation."
+                        if language is None:
+                            msg += " No fallback language was provided when calling DASH.to_tracks()."
+                        elif not tag_is_valid((str(language) or "").strip()) or str(language).startswith("und"):
+                            msg += f" The fallback language provided is also invalid: {language}"
+                        raise ValueError(msg)
 
                     # for some reason it's incredibly common for services to not provide
                     # a good and actually unique track ID, sometimes because of the lang
                     # dialect not being represented in the id, or the bitrate, or such.
                     # this combines all of them as one and hashes it to keep it small(ish).
-                    track_id = md5("{codec}-{lang}-{bitrate}-{base_url}-{extra}".format(
+                    track_id = md5("{codec}-{lang}-{bitrate}-{base_url}-{ids}-{track_args}".format(
                         codec=codecs,
                         lang=track_lang,
-                        bitrate=rep.get("bandwidth") or 0,  # subs may not state bandwidth
+                        bitrate=get("bitrate"),
                         base_url=(rep.findtext("BaseURL") or "").split("?")[0],
-                        extra=(adaptation_set.get("audioTrackId") or "") + (rep.get("id") or "") +
-                              (period.get("id") or "")
+                        ids=[get("audioTrackId"), get("id"), period.get("id")],
+                        track_args=track_args
                     ).encode()).hexdigest()
-
-                    if content_type == "video":
-                        track_type = Video
-                        track_codec = Video.Codec.from_codecs(codecs)
-                    elif content_type == "audio":
-                        track_type = Audio
-                        track_codec = Audio.Codec.from_codecs(codecs)
-                    elif content_type == "text":
-                        track_type = Subtitle
-                        track_codec = Subtitle.Codec.from_codecs(codecs or "vtt")
-                    else:
-                        raise ValueError(f"Unknown Track Type '{content_type}'")
 
                     tracks.add(track_type(
                         id_=track_id,
                         url=(self.url, self.manifest, rep, adaptation_set, period),
                         codec=track_codec,
                         language=track_lang,
-                        is_original_lang=not track_lang or not language or is_close_match(track_lang, [language]),
+                        is_original_lang=language and is_close_match(track_lang, [language]),
                         descriptor=Video.Descriptor.MPD,
                         extra=(rep, adaptation_set),
+<<<<<<< HEAD
                         manifest=self.manifest,
                         # video track args
                         **(dict(
@@ -271,6 +268,9 @@ class DASH:
                             forced=forced,
                             cc=cc
                         ) if track_type is Subtitle else {})
+=======
+                        **track_args
+>>>>>>> d369e6134c65359e4842ba5e8b1a854d0bdb4cd0
                     ))
 
             # only get tracks from the first main-content period
@@ -416,11 +416,11 @@ class DASH:
                         source_url = rep_base_url
 
                     if initialization.get("range"):
-                        headers = {"Range": f"bytes={initialization.get('range')}"}
+                        init_range_header = {"Range": f"bytes={initialization.get('range')}"}
                     else:
-                        headers = None
+                        init_range_header = None
 
-                    res = session.get(url=source_url, headers=headers)
+                    res = session.get(url=source_url, headers=init_range_header)
                     res.raise_for_status()
                     init_data = res.content
                     track_kid = track.get_key_id(init_data)
@@ -450,12 +450,18 @@ class DASH:
             if track.drm:
                 # last chance to find the KID, assumes first segment will hold the init data
                 track_kid = track_kid or track.get_key_id(url=segments[0][0], session=session)
-                # license and grab content keys
-                drm = track.drm[0]  # just use the first supported DRM system for now
+                # TODO: What if we don't want to use the first DRM system?
+                drm = track.drm[0]
                 if isinstance(drm, Widevine):
-                    if not license_widevine:
-                        raise ValueError("license_widevine func must be supplied to use Widevine DRM")
-                    license_widevine(drm, track_kid=track_kid)
+                    # license and grab content keys
+                    try:
+                        if not license_widevine:
+                            raise ValueError("license_widevine func must be supplied to use Widevine DRM")
+                        license_widevine(drm, track_kid=track_kid)
+                    except Exception:  # noqa
+                        stop_event.set()  # skip pending track downloads
+                        progress(downloaded="[red]FAILED")
+                        raise
             else:
                 drm = None
 
@@ -463,90 +469,27 @@ class DASH:
                 progress(downloaded="[yellow]SKIPPED")
                 return
 
-            def download_segment(filename: str, segment: tuple[str, Optional[str]]) -> int:
-                if stop_event.is_set():
-                    # the track already started downloading, but another failed or was stopped
-                    raise KeyboardInterrupt()
-
-                segment_save_path = (save_dir / filename).with_suffix(".mp4")
-
-                segment_uri, segment_range = segment
-
-                attempts = 1
-                while True:
-                    try:
-                        if segment_range:
-                            # aria2(c) doesn't support byte ranges, let's use python-requests (likely slower)
-                            res = session.get(
-                                url=segment_uri,
-                                headers={
-                                    "Range": f"bytes={segment_range}"
-                                }
-                            )
-                            res.raise_for_status()
-                            segment_save_path.parent.mkdir(parents=True, exist_ok=True)
-                            segment_save_path.write_bytes(res.content)
-                        else:
-                            asyncio.run(aria2c(
-                                uri=segment_uri,
-                                out=segment_save_path,
-                                headers=session.headers,
-                                proxy=proxy,
-                                silent=attempts != 5,
-                                segmented=True
-                            ))
-                        break
-                    except Exception as ee:
-                        if stop_event.is_set() or attempts == 5:
-                            raise ee
-                        time.sleep(2)
-                        attempts += 1
-
-                data_size = segment_save_path.stat().st_size
-
-                if isinstance(track, Audio) or init_data:
-                    with open(segment_save_path, "rb+") as f:
-                        segment_data = f.read()
-                        if isinstance(track, Audio):
-                            # fix audio decryption on ATVP by fixing the sample description index
-                            # TODO: Is this in mpeg data, or init data?
-                            segment_data = re.sub(
-                                b"(tfhd\x00\x02\x00\x1a\x00\x00\x00\x01\x00\x00\x00)\x02",
-                                b"\\g<1>\x01",
-                                segment_data
-                            )
-                        # prepend the init data to be able to decrypt
-                        if init_data:
-                            f.seek(0)
-                            f.write(init_data)
-                            f.write(segment_data)
-
-                if drm:
-                    # TODO: What if the manifest does not mention DRM, but has DRM
-                    drm.decrypt(segment_save_path)
-                    track.drm = None
-                    if callable(track.OnDecrypted):
-                        track.OnDecrypted(track)
-
-                return data_size
-
             progress(total=len(segments))
 
-            finished_threads = 0
             download_sizes = []
+            download_speed_window = 5
             last_speed_refresh = time.time()
 
             with ThreadPoolExecutor(max_workers=16) as pool:
-                for download in futures.as_completed((
+                for i, download in enumerate(futures.as_completed((
                     pool.submit(
-                        download_segment,
-                        filename=str(i).zfill(len(str(len(segments)))),
-                        segment=segment
+                        DASH.download_segment,
+                        url=url,
+                        out_path=(save_dir / str(n).zfill(len(str(len(segments))))).with_suffix(".mp4"),
+                        track=track,
+                        proxy=proxy,
+                        headers=session.headers,
+                        cookies=session.cookies,
+                        bytes_range=bytes_range,
+                        stop_event=stop_event
                     )
-                    for i, segment in enumerate(segments)
-                )):
-                    finished_threads += 1
-
+                    for n, (url, bytes_range) in enumerate(segments)
+                ))):
                     try:
                         download_size = download.result()
                     except KeyboardInterrupt:
@@ -557,16 +500,15 @@ class DASH:
                         # tell dl that it was cancelled
                         # the pool is already shut down, so exiting loop is fine
                         raise
-                    except Exception as e:
+                    except Exception:
                         stop_event.set()  # skip pending track downloads
                         progress(downloaded="[red]FAILING")
                         pool.shutdown(wait=True, cancel_futures=True)
                         progress(downloaded="[red]FAILED")
                         # tell dl that it failed
                         # the pool is already shut down, so exiting loop is fine
-                        raise e
+                        raise
                     else:
-                        # it successfully downloaded, and it was not cancelled
                         progress(advance=1)
 
                         now = time.time()
@@ -575,7 +517,7 @@ class DASH:
                         if download_size:  # no size == skipped dl
                             download_sizes.append(download_size)
 
-                        if download_sizes and (time_since > 5 or finished_threads == len(segments)):
+                        if download_sizes and (time_since > download_speed_window or i == len(segments)):
                             data_size = sum(download_sizes)
                             download_speed = data_size / (time_since or 1)
                             progress(downloaded=f"DASH {filesize.decimal(download_speed)}/s")
@@ -583,15 +525,171 @@ class DASH:
                             download_sizes.clear()
 
             with open(save_path, "wb") as f:
+                if init_data:
+                    f.write(init_data)
                 for segment_file in sorted(save_dir.iterdir()):
                     f.write(segment_file.read_bytes())
                     segment_file.unlink()
 
+            if drm:
+                progress(downloaded="Decrypting", completed=0, total=100)
+                drm.decrypt(save_path)
+                track.drm = None
+                if callable(track.OnDecrypted):
+                    track.OnDecrypted(track)
+                progress(downloaded="Decrypted", completed=100)
+
             track.path = save_path
             save_dir.rmdir()
 
+            progress(downloaded="Downloaded")
+
     @staticmethod
-    def get_language(*options: Any) -> Optional[Language]:
+    def download_segment(
+        url: str,
+        out_path: Path,
+        track: AnyTrack,
+        proxy: Optional[str] = None,
+        headers: Optional[MutableMapping[str, str | bytes]] = None,
+        cookies: Optional[Union[MutableMapping[str, str], RequestsCookieJar]] = None,
+        bytes_range: Optional[str] = None,
+        stop_event: Optional[Event] = None
+    ) -> int:
+        """
+        Download a DASH Media Segment.
+
+        Parameters:
+            url: Full HTTP(S) URL to the Segment you want to download.
+            out_path: Path to save the downloaded Segment file to.
+            track: The Track object of which this Segment is for. Currently only used to
+                fix an invalid value in the TFHD box of Audio Tracks.
+            proxy: Proxy URI to use when downloading the Segment file.
+            headers: HTTP Headers to send when requesting the Segment file.
+            cookies: Cookies to send when requesting the Segment file. The actual cookies sent
+                will be resolved based on the URI among other parameters. Multiple cookies with
+                the same name but a different domain/path are resolved.
+            bytes_range: Download only specific bytes of the Segment file using the Range header.
+            stop_event: Prematurely stop the Download from beginning. Useful if ran from
+                a Thread Pool. It will raise a KeyboardInterrupt if set.
+
+        Returns the file size of the downloaded Segment in bytes.
+        """
+        if stop_event and stop_event.is_set():
+            raise KeyboardInterrupt()
+
+        attempts = 1
+        while True:
+            try:
+                if bytes_range:
+                    # aria2(c) doesn't support byte ranges, use python-requests
+                    downloader_ = requests_downloader
+                    headers_ = dict(**headers, Range=f"bytes={bytes_range}")
+                else:
+                    downloader_ = downloader
+                    headers_ = headers
+                downloader_(
+                    uri=url,
+                    out=out_path,
+                    headers=headers_,
+                    cookies=cookies,
+                    proxy=proxy,
+                    silent=attempts != 5,
+                    segmented=True
+                )
+                break
+            except Exception as ee:
+                if (stop_event and stop_event.is_set()) or attempts == 5:
+                    raise ee
+                time.sleep(2)
+                attempts += 1
+
+        # fix audio decryption on ATVP by fixing the sample description index
+        # TODO: Should this be done in the video data or the init data?
+        if isinstance(track, Audio):
+            with open(out_path, "rb+") as f:
+                segment_data = f.read()
+                fixed_segment_data = re.sub(
+                    b"(tfhd\x00\x02\x00\x1a\x00\x00\x00\x01\x00\x00\x00)\x02",
+                    b"\\g<1>\x01",
+                    segment_data
+                )
+                if fixed_segment_data != segment_data:
+                    f.seek(0)
+                    f.write(fixed_segment_data)
+
+        return out_path.stat().st_size
+
+    @staticmethod
+    def _get(
+        item: str,
+        adaptation_set: Element,
+        representation: Optional[Element] = None
+    ) -> Optional[Any]:
+        """Helper to get a requested item from the Representation, otherwise from the AdaptationSet."""
+        adaptation_set_item = adaptation_set.get(item)
+        if representation is None:
+            return adaptation_set_item
+
+        representation_item = representation.get(item)
+        if representation_item is not None:
+            return representation_item
+
+        return adaptation_set_item
+
+    @staticmethod
+    def _findall(
+        item: str,
+        adaptation_set: Element,
+        representation: Optional[Element] = None,
+        both: bool = False
+    ) -> list[Any]:
+        """
+        Helper to get all requested items from the Representation, otherwise from the AdaptationSet.
+        Optionally, you may pass both=True to keep both values (where available).
+        """
+        adaptation_set_items = adaptation_set.findall(item)
+        if representation is None:
+            return adaptation_set_items
+
+        representation_items = representation.findall(item)
+
+        if both:
+            return representation_items + adaptation_set_items
+
+        if representation_items:
+            return representation_items
+
+        return adaptation_set_items
+
+    @staticmethod
+    def get_language(
+        adaptation_set: Element,
+        representation: Optional[Element] = None,
+        fallback: Optional[Union[str, Language]] = None
+    ) -> Optional[Language]:
+        """
+        Get Language (if any) from the AdaptationSet or Representation.
+
+        A fallback language may be provided if no language information could be
+        retrieved.
+        """
+        options = []
+
+        if representation is not None:
+            options.append(representation.get("lang"))
+            # derive language from somewhat common id string format
+            # the format is typically "{rep_id}_{lang}={bitrate}" or similar
+            rep_id = representation.get("id")
+            if rep_id:
+                m = re.match(r"\w+_(\w+)=\d+", rep_id)
+                if m:
+                    options.append(m.group(1))
+
+        options.append(adaptation_set.get("lang"))
+
+        if fallback:
+            options.append(fallback)
+
         for option in options:
             option = (str(option) or "").strip()
             if not tag_is_valid(option) or option.startswith("und"):
@@ -599,7 +697,82 @@ class DASH:
             return Language.get(option)
 
     @staticmethod
-    def get_drm(protections) -> list[Widevine]:
+    def get_video_range(
+        codecs: str,
+        all_supplemental_props: list[Element],
+        all_essential_props: list[Element]
+    ) -> Video.Range:
+        if codecs.startswith(("dva1", "dvav", "dvhe", "dvh1")):
+            return Video.Range.DV
+
+        return Video.Range.from_cicp(
+            primaries=next((
+                int(x.get("value"))
+                for x in all_supplemental_props + all_essential_props
+                if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ColourPrimaries"
+            ), 0),
+            transfer=next((
+                int(x.get("value"))
+                for x in all_supplemental_props + all_essential_props
+                if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:TransferCharacteristics"
+            ), 0),
+            matrix=next((
+                int(x.get("value"))
+                for x in all_supplemental_props + all_essential_props
+                if x.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:MatrixCoefficients"
+            ), 0)
+        )
+
+    @staticmethod
+    def is_trick_mode(adaptation_set: Element) -> bool:
+        """Check if contents of Adaptation Set is a Trick-Mode stream."""
+        essential_props = adaptation_set.findall("EssentialProperty")
+        supplemental_props = adaptation_set.findall("SupplementalProperty")
+
+        return any(
+            prop.get("schemeIdUri") == "http://dashif.org/guidelines/trickmode"
+            for prop in essential_props + supplemental_props
+        )
+
+    @staticmethod
+    def is_descriptive(adaptation_set: Element) -> bool:
+        """Check if contents of Adaptation Set is Descriptive."""
+        return any(
+            (x.get("schemeIdUri"), x.get("value")) in (
+                ("urn:mpeg:dash:role:2011", "descriptive"),
+                ("urn:tva:metadata:cs:AudioPurposeCS:2007", "1")
+            )
+            for x in adaptation_set.findall("Accessibility")
+        )
+
+    @staticmethod
+    def is_forced(adaptation_set: Element) -> bool:
+        """Check if contents of Adaptation Set is a Forced Subtitle."""
+        return any(
+            x.get("schemeIdUri") == "urn:mpeg:dash:role:2011"
+            and x.get("value") in ("forced-subtitle", "forced_subtitle")
+            for x in adaptation_set.findall("Role")
+        )
+
+    @staticmethod
+    def is_closed_caption(adaptation_set: Element) -> bool:
+        """Check if contents of Adaptation Set is a Closed Caption Subtitle."""
+        return any(
+            (x.get("schemeIdUri"), x.get("value")) == ("urn:mpeg:dash:role:2011", "caption")
+            for x in adaptation_set.findall("Role")
+        )
+
+    @staticmethod
+    def get_ddp_complexity_index(adaptation_set: Element, representation: Optional[Element]) -> Optional[int]:
+        """Get the DD+ Complexity Index (if any) from the AdaptationSet or Representation."""
+        return next((
+            int(x.get("value"))
+            for x in DASH._findall("SupplementalProperty", adaptation_set, representation, both=True)
+            if x.get("schemeIdUri") == "tag:dolby.com,2018:dash:EC3_ExtensionComplexityIndex:2018"
+        ), None)
+
+    @staticmethod
+    def get_drm(protections: list[Element]) -> list[Widevine]:
         drm = []
 
         for protection in protections:

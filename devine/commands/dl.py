@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import html
 import logging
 import math
@@ -25,6 +24,7 @@ import click
 import jsonpickle
 import pycaption
 import yaml
+from construct import ConstError
 from pymediainfo import MediaInfo
 from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.device import Device
@@ -43,7 +43,7 @@ from devine.core.config import config
 from devine.core.console import console
 from devine.core.constants import AnyTrack, context_settings
 from devine.core.credential import Credential
-from devine.core.downloaders import aria2c
+from devine.core.downloaders import downloader
 from devine.core.drm import DRM_T, Widevine
 from devine.core.manifests import DASH, HLS
 from devine.core.proxies import Basic, Hola, NordVPN
@@ -51,7 +51,7 @@ from devine.core.service import Service
 from devine.core.services import Services
 from devine.core.titles import Movie, Song, Title_T
 from devine.core.titles.episode import Episode
-from devine.core.tracks import Audio, Subtitle, Video
+from devine.core.tracks import Audio, Subtitle, Video, Tracks
 from devine.core.utilities import get_binary_path, is_close_match, time_elapsed_since
 from devine.core.utils.click_types import LANGUAGE_RANGE, SEASON_RANGE, ContextData, QUALITY_LIST
 from devine.core.utils.collections import merge_dict
@@ -102,6 +102,8 @@ class dl:
                   help="Proxy URI to use. If a 2-letter country is provided, it will try get a proxy from the config.")
     @click.option("--group", type=str, default=None,
                   help="Set the Group Tag to be used, overriding the one in config if any.")
+    @click.option("-V", "--video-only", is_flag=True, default=False,
+                  help="Only download video tracks.")
     @click.option("-A", "--audio-only", is_flag=True, default=False,
                   help="Only download audio tracks.")
     @click.option("-S", "--subs-only", is_flag=True, default=False,
@@ -259,6 +261,7 @@ class dl:
         lang: list[str],
         v_lang: list[str],
         s_lang: list[str],
+        video_only: bool,
         audio_only: bool,
         subs_only: bool,
         chapters_only: bool,
@@ -436,23 +439,17 @@ class dl:
                             self.log.error(f"There's no {lang} Audio Track, cannot continue...")
                             sys.exit(1)
 
-                if audio_only or subs_only or chapters_only:
-                    title.tracks.videos.clear()
+                if video_only or audio_only or subs_only or chapters_only:
+                    kept_tracks = []
+                    if video_only:
+                        kept_tracks.extend(title.tracks.videos)
                     if audio_only:
-                        if not subs_only:
-                            title.tracks.subtitles.clear()
-                        if not chapters_only:
-                            title.tracks.chapters.clear()
-                    elif subs_only:
-                        if not audio_only:
-                            title.tracks.audio.clear()
-                        if not chapters_only:
-                            title.tracks.chapters.clear()
-                    elif chapters_only:
-                        if not audio_only:
-                            title.tracks.audio.clear()
-                        if not subs_only:
-                            title.tracks.subtitles.clear()
+                        kept_tracks.extend(title.tracks.audio)
+                    if subs_only:
+                        kept_tracks.extend(title.tracks.subtitles)
+                    if chapters_only:
+                        kept_tracks.extend(title.tracks.chapters)
+                    title.tracks = Tracks(kept_tracks)
 
             selected_tracks, tracks_progress_callables = title.tracks.tree(add_progress=True)
 
@@ -906,21 +903,26 @@ class dl:
                     if self.DL_POOL_SKIP.is_set():
                         progress(downloaded="[yellow]SKIPPED")
                     else:
-                        asyncio.run(aria2c(
+                        downloader(
                             uri=track.url,
                             out=save_path,
                             headers=service.session.headers,
+                            cookies=service.session.cookies,
                             proxy=proxy if track.needs_proxy else None,
                             progress=progress
-                        ))
+                        )
 
                         track.path = save_path
 
                         if drm:
+                            progress(downloaded="Decrypting", completed=0, total=100)
                             drm.decrypt(save_path)
                             track.drm = None
                             if callable(track.OnDecrypted):
                                 track.OnDecrypted(track)
+                            progress(downloaded="Decrypted", completed=100)
+
+                        progress(downloaded="Downloaded")
                 except KeyboardInterrupt:
                     self.DL_POOL_STOP.set()
                     progress(downloaded="[yellow]STOPPED")
@@ -1020,5 +1022,14 @@ class dl:
         cdm_path = config.directories.wvds / f"{cdm_name}.wvd"
         if not cdm_path.is_file():
             raise ValueError(f"{cdm_name} does not exist or is not a file")
-        device = Device.load(cdm_path)
+
+        try:
+            device = Device.load(cdm_path)
+        except ConstError as e:
+            if "expected 2 but parsed 1" in str(e):
+                raise ValueError(
+                    f"{cdm_name}.wvd seems to be a v1 WVD file, use `pywidevine migrate --help` to migrate it to v2."
+                )
+            raise ValueError(f"{cdm_name}.wvd is an invalid or corrupt Widevine Device file, {e}")
+
         return WidevineCdm.from_device(device)
