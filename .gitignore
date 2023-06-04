@@ -22,7 +22,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+manifest_params*
 # Distribution / packaging
 .Python
 build/
