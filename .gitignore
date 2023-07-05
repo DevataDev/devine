@@ -125,3 +125,4 @@ venv.bak/
 .directory
 .idea/dataSources.local.xml
 .vscode/settings.json
+.DS_Store
